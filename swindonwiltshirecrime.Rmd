@@ -1,0 +1,207 @@
+---
+title: "Swindon and Wiltshire Police Association Rules"
+author: "Alistair Rogers"
+date: "4/5/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=F}
+library(visNetwork)
+library(sparklyr)
+library(tidyverse)
+library(reshape2)
+library(leaflet)
+library(leaflet.extras)
+```
+
+
+## Introduction
+
+Data about crimes reported by a particular police force/constabulary is published here: <https://data.police.uk/data/>
+
+As a Swindoner born and bred, I have noticed the amount of weirdness and crime that goes on in my area and I am interested in if there are any associations.
+
+In this little project, I have used all of the Wiltshire Police Crime data from March 2015 to February 2018. Knowing Swindon, this may require a Spark job. (Yes that's right, I did just insult my hometown with Big Data, I am hilarious.)
+
+### Reading the data
+data.police.gov.uk provide a different file for all of the crimes that happened in a partiuclar month. Also these are all contained in different folders. e.g. 2015-03, 2017-01 and so on.
+I will need all of these in one file so I will run a quick bash command to append these together.
+
+```{bash, eval=FALSE}
+rm wiltshirepolice.csv
+touch wiltshirepolice.csv
+FILES="~Documents/Police/*/*.csv"
+OUTPUT="wiltshirepolice.csv"
+i=0
+for filename in $FILES; do
+if [ "$filename"  != "$OUTPUT" ] ;      # Avoid recursion
+ then
+   if [[ $i -eq 0 ]] ; then
+      head -1  $filename >   $OUTPUT # Copy header if it is the first file
+   fi
+   tail -n +2  $filename >>  $OUTPUT # Append from the 2nd line each file
+   i=$(( $i + 1 ))                        # Increase the counter
+ fi
+done
+```
+
+Lets have a look at the structure of the data...
+
+```{r, message=FALSE}
+df <- read_csv('wiltshirepolice.csv')
+```
+
+```{r}
+str(df)
+```
+
+As we can see, we have 174085 recorded crimes with their approximate location (inc. Lat, Long, Street, Lower Layer Super Output Area). We also have the crime type and the last outcome category of the particular crime. 
+
+### Data Cleaning
+
+On initial inspection, it seems that cases/incidents that do not have a Crime ID also do not have a Last Outcome Category. Lets check this:
+
+```{r}
+null_test <- df %>% dplyr::select('Crime ID', 'Last outcome category')
+# Check number of rows where Crime ID is NULL and Last outcome category is not NULL
+test_1 <- null_test %>% dplyr::filter(is.na('Crime ID') & !is.na('Last outcome category')) %>%
+  nrow()
+# Check number of rows where Crime ID is not NULL and Last outcome category is NULL
+test_2 <- null_test %>% dplyr::filter(!is.na('Crime ID') & is.na('Last outcome category')) %>%
+  nrow()
+print(c(test_1, test_2))
+```
+I am only going to keep Last outcome category for this purpose as I don't really require an ID.
+
+Also, all the crimes should have been reported by Wiltshire Police as well as falling under the jurisidiction of Wiltshire Police.. If this is the case, then we can drop it.
+
+```{r}
+colnames(df)
+```
+
+```{r}
+df %>% count(`Reported by`)
+```
+
+On a related note, I am only interested in the data for Wiltshire (inc. Swindon). Therefore I want to remove any LSOAs that aren't Wiltshire or Swindon. Let's see if any exist.
+
+```{r}
+df %>% filter(!grepl('Swindon', `LSOA name`) & !grepl('Wiltshire', `LSOA name`)) %>%
+  count()
+```
+
+Now the column Context appears to be entirely full of NAs. Lets check this.
+
+```{r}
+df %>% filter(!is.na(Context)) %>% 
+  nrow()
+```
+
+Now lets look at the most common elements in the Last Outcome Category
+It seems that we have a large amount of NAs, but why?
+
+```{r}
+df %>% select(`Last outcome category`) %>%
+  table(useNA = 'always') %>%
+  sort(decreasing = T) %>%
+  head(10)
+```
+
+On first glance, it appears to be Anti Social Behaviour cases that all have NAs
+
+```{r}
+df %>% filter(is.na(`Last outcome category`)) %>% 
+  select(-c(`LSOA code`, `Crime ID`,  `Reported by`, `Falls within`, Context, Month, Longitude, Latitude)) %>%
+  head(10)
+```
+
+To confirm this, let's look deeper:
+
+```{r}
+df %>% filter(is.na(`Last outcome category`)) %>% 
+  select(`Crime type`) %>%
+  table()
+```
+
+Well this is very worrying that all of the Anti Social Behaviour cases are null for their outcome category.
+
+Unfortunately, there could be a number of outcomes associated with Anti Social Behaviour, I can't just assume that they are all unresolved. So, unfortunately, I will have to exclude anti-social behaviour from my association rules.
+
+```{r}
+df %>% filter(`Crime type` == 'Anti-social behaviour') %>% 
+  select(`Last outcome category`) %>%
+  table()
+```
+
+Lets finish the data cleaning
+
+```{r}
+df_clean <- df %>% select(-c(`Crime ID`, `Reported by`, 
+                             `Falls within`, `LSOA code`, Context)) %>%
+  filter(grepl('Swindon', `LSOA name`) | grepl('Wiltshire', `LSOA name`)) %>%
+  filter(`Crime type` != 'Anti-social behaviour') %>%
+  mutate(Location = trimws(str_replace(Location, 'On or near', ""))) %>%
+  rowid_to_column("id")
+```
+
+### Some Visualisation
+Lets look at all of the crime in Wiltshire via a heatmap
+
+```{r}
+df %>% filter(grepl('Swindon', `LSOA name`) | grepl('Wiltshire', `LSOA name`)) %>%
+  select(Longitude, Latitude) %>% 
+  group_by(Longitude, Latitude) %>% 
+  count() %>%
+  leaflet() %>%
+  addTiles() %>%
+  addWebGLHeatmap(lng=~Longitude, lat=~Latitude, intensity = ~n, size=1000, opacity = 0.6)
+```
+
+
+### Feature Engineering and Introducing Spark.
+Well, I say Feature Engineering. In order to use association rules in sparklyr, I need to have my data in the right format.
+
+I will need to convert my wide form data into a long format, then collect each element by id into a list.
+
+I am looking for associations between the Location of the crime, the outcome and the crime type.
+
+```{r}
+df_assoc <- df_clean %>% select(id,
+                                  Location, 
+                                `Crime type`, 
+                                `Last outcome category`) %>%
+  melt(id.vars = 'id') %>%
+  select(id, value)
+
+head(df_assoc)
+```
+
+Now lets set up our spark instance and copy our data into the environment:
+
+```{r}
+#' Initialise a local instance of Spark (production version would use a cluster)
+Sys.setenv(SPARK_HOME = '/usr/local/Cellar/apache-spark/2.2.1/libexec')
+sc <- spark_connect(master='local')
+
+#' Copy Data to Environment
+df_assoc_tbl <- sdf_copy_to(sc, df_assoc, overwrite = T)
+
+```
+
+
+In order to create the 'basket' commonly used in Association Rule mining, we will need to collect each element by id into a list.
+
+```{r}
+df_assoc_collect <- df_assoc_tbl %>% 
+  group_by(id) %>%
+  summarise(
+    items = collect_list(value)
+  )
+
+```
+
+Now there is no native 

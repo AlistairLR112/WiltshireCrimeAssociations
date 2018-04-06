@@ -72,6 +72,8 @@ df_assoc_collect <- df_assoc_tbl %>%
     items = collect_list(value)
   )
 
+ml_fpgrowth(df_assoc_collect)
+
 uid = sparklyr:::random_string("fpgrowth_")
 jobj = invoke_new(sc, "org.apache.spark.ml.fpm.FPGrowth", uid) 
 
@@ -79,7 +81,7 @@ FPGmodel <- jobj %>%
   invoke("setItemsCol", "items") %>%
   invoke("setMinConfidence", 0.03) %>%
   invoke("setMinSupport", 0.01)  %>%
-  invoke("fit", spark_dataframe(df_assoc_test))
+  invoke("fit", spark_dataframe(df_assoc_collect))
 
 ml_fpgrowth_extract_rules = function(FPGmodel, nLHS = 2, nRHS = 1)
 {

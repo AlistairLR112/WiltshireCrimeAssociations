@@ -152,17 +152,7 @@ df_clean <- df %>% select(-c(`Crime ID`, `Reported by`,
 ```
 
 ### Some Visualisation
-Lets look at all of the crime in Wiltshire via a heatmap
-
-```{r}
-df %>% filter(grepl('Swindon', `LSOA name`) | grepl('Wiltshire', `LSOA name`)) %>%
-  select(Longitude, Latitude) %>% 
-  group_by(Longitude, Latitude) %>% 
-  count() %>%
-  leaflet() %>%
-  addTiles() %>%
-  addWebGLHeatmap(lng=~Longitude, lat=~Latitude, intensity = ~n, size=1000, opacity = 0.6)
-```
+Visualisation removed from the markdown, will get to adding a html version
 
 
 ### Feature Engineering and Introducing Spark.
@@ -174,7 +164,8 @@ I am looking for associations between the Location of the crime, the outcome and
 
 ```{r}
 df_assoc <- df_clean %>% select(id,
-                                  Location, 
+                                  `LSOA name`,
+                                Location,
                                 `Crime type`, 
                                 `Last outcome category`) %>%
   melt(id.vars = 'id') %>%
@@ -188,10 +179,10 @@ Now lets set up our spark instance and copy our data into the environment:
 ```{r}
 #' Initialise a local instance of Spark (production version would use a cluster)
 Sys.setenv(SPARK_HOME = '/usr/local/Cellar/apache-spark/2.2.1/libexec')
-sc <- spark_connect(master='local')
+sc <- sparklyr::spark_connect(master='local')
 
 #' Copy Data to Environment
-df_assoc_tbl <- sdf_copy_to(sc, df_assoc, overwrite = T)
+df_assoc_tbl <- sparklyr::sdf_copy_to(sc, df_assoc, overwrite = T)
 
 ```
 
@@ -207,4 +198,22 @@ df_assoc_collect <- df_assoc_tbl %>%
 
 ```
 
-Now there is no native 
+We will be using the FPGrowth algorithm which is a better version of apriori for large datasets.
+
+There used to be no method for this in sparklyr so one would have to invoke it from Scala. But now there is!
+
+
+Now lets build our association rule model, specifying a minimum confidence of 0.7 and a minimum support of 0.01
+
+```{r}
+model <- sparklyr::ml_fpgrowth(df_assoc_collect, min_support = 0.01, min_confidence = 0.7)
+rules <- sparklyr::ml_association_rules(model)
+as.data.frame(rules)
+```
+
+Well, what are we saying here?
+If your Bike, Car or Home Possessions get stolen in Swindon or Wiltshire, give up. The case will be closed with no suspect identified...
+
+```{r}
+sparklyr::spark_disconnect(sc)
+```

@@ -12,7 +12,7 @@ output:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r, echo=F}
+```{r, echo=F, message=F}
 library(visNetwork)
 library(sparklyr)
 library(tidyverse)
